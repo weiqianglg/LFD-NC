@@ -1,5 +1,5 @@
 ## LFD-NC
-for the incoming paper "Unifying Node Label, Feature and Distance for Deep Network Completion"
+for “Unifying Node Labels, Features, and Distances for Deep Network Completion” in Entropy.
 
 
 # env
