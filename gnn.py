@@ -79,9 +79,25 @@ class CompletionWithGcn(model.ModelBase):
         super().__init__(data_graph)
         self.neural_network = GcnNet(data_graph.feature_dim)
         self.adj = None
+        self.positive_edge_mask = None
+        self.non_edge_mask = None
 
     def set_adj(self, _adj):
         self.adj = _adj
+
+    def set_positive_non_edge(self, positive_edge_mask, non_edge_mask):
+        self.positive_edge_mask = torch.tensor(positive_edge_mask)
+        self.non_edge_mask = torch.tensor(non_edge_mask)
+
+    def inner_product(self, z, edge_index):
+        s = super().inner_product(z, edge_index)
+        if (not self.neural_network.training) and config.DISTANCE_CONSTRAINT and config.DISTANCE_BORDER_NODE_NUM > 0:
+            row, col = edge_index[0], edge_index[1]
+            positive_mask = self.positive_edge_mask[row, col]
+            non_edge_mask = self.non_edge_mask[row, col]
+            s[positive_mask] = 1
+            s[non_edge_mask] = 0
+        return s
 
     def run(self):
         return super().run((self.data_graph.data.x, self.adj))
@@ -90,38 +106,47 @@ class CompletionWithGcn(model.ModelBase):
 class RefineAdj:
     def __init__(self, data_graph):
         self.data_graph = data_graph
-        self.adj_matrix_leaner = CompletionWithGcn(data_graph)
-        self.smb_adj = self.data_graph.get_label_smb_matrix()
+        self.adj_matrix_learner = CompletionWithGcn(data_graph)
+        if config.DISTANCE_CONSTRAINT and config.DISTANCE_BORDER_NODE_NUM > 0:
+            self.adj_matrix_learner.set_positive_non_edge(
+                self.data_graph.positive_edge_mask,
+                self.data_graph.no_edge_mask
+            )
+
+        self.sbm_adj = self.data_graph.get_simple_sbm_matrix()
+        # config.SMB_RATIO = 1
+        # self.sbm_adj = self.data_graph.get_sbm_matrix()
+        # self.sbm_adj = torch.tensor(self.sbm_adj).to(torch.float32)
 
     def run(self):
         val_indicator = config.VAL_INDICATOR
         total_metric = pd.DataFrame()
         adj = self.get_adj_matrix(True)
-        self.adj_matrix_leaner.set_adj(adj)
+        self.adj_matrix_learner.set_adj(adj)
 
         total_best_metric = pd.DataFrame([[0, 0, 0, 0, 'test', 0]],
                                          columns=['AUC', 'AP', 'POS_MAE', 'NEG_MAE', 'TYPE', 'EPOCH'])
         for i in range(config.ROUND):
-            metric, best_metric = self.adj_matrix_leaner.run()
+            metric, best_metric = self.adj_matrix_learner.run()
             metric['EPOCH'] = total_metric.shape[0] + numpy.array(
                 range(metric.shape[0]))  # index error here, should split val and test
             total_metric = total_metric.append(metric)
             if total_best_metric[val_indicator][0] < best_metric[val_indicator][0]:
                 total_best_metric = best_metric
             adj = self.get_adj_matrix(False)
-            self.adj_matrix_leaner.set_adj(adj)
+            self.adj_matrix_learner.set_adj(adj)
         return total_metric, total_best_metric
 
     def get_adj_matrix(self, init=True):
         if init:
             beta = config.SMB_RATIO
-            adj1 = beta * self.smb_adj
+            adj1 = beta * self.sbm_adj
         else:
-            # self.adj_matrix_leaner.mpl.load_state_dict(torch.load("mygcn.pth"))
-            self.adj_matrix_leaner.neural_network.eval()
+            # self.adj_matrix_learner.mpl.load_state_dict(torch.load("mygcn.pth"))
+            self.adj_matrix_learner.neural_network.eval()
             with torch.no_grad():
-                z = self.adj_matrix_leaner.neural_network((self.data_graph.data.x, None))
-            adj0 = self.adj_matrix_leaner.inner_product_all(z)
+                z = self.adj_matrix_learner.neural_network((self.data_graph.data.x, None))
+            adj0 = self.adj_matrix_learner.inner_product_all(z)
             alpha = config.ADJ_CUT
             adj0[adj0 < alpha] = 0
             adj1 = adj0
@@ -134,9 +159,7 @@ class RefineAdj:
         adj1[col, row] = 1
 
         if config.DISTANCE_CONSTRAINT and config.DISTANCE_BORDER_NODE_NUM > 0:
-            row, col = self.data_graph.one_hop_edge_index
-            adj1[row, col] = 1
-            adj1[col, row] = 1
+            adj1[self.data_graph.positive_edge_mask] = 1
             adj1[self.data_graph.no_edge_mask] = 0
         return adj1
 
@@ -154,4 +177,3 @@ if __name__ == '__main__':
 
     config.DISTANCE_BORDER_NODE_NUM = 5
     run(0)
-

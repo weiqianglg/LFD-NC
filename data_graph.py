@@ -2,6 +2,7 @@ import logging
 import random
 from collections import defaultdict
 from itertools import combinations, product
+from itertools import combinations_with_replacement
 import networkx as nx
 import numpy as np
 import torch
@@ -40,18 +41,24 @@ class SplitGraph(object):
         self.reorder_node()
         # self.store_graph()
 
+        self.train_mask = self.set_train_mask()
+
+        self.distance_edge_ratio = 0
+        self.distance_non_edge_ratio = 0
+        self.distance_inner_edge_ratio = 0
+        self.distance_non_inner_edge_ratio = 0
         if config.DISTANCE_CONSTRAINT and config.DISTANCE_BORDER_NODE_NUM > 0:
-            self.border_node = self.get_border_node(config.DISTANCE_BORDER_NODE_NUM
+            self.detect_node = self.get_detect_node(config.DISTANCE_BORDER_NODE_NUM
                                                     )  # for distance constrains, border node is the nodes whose neighbors not all in the observed graph
-            self.no_edge_mask, self.one_hop_edge_index = self.get_distance_constrain()
+            self.no_edge_mask, self.positive_edge_mask = self.get_distance_constrain()
 
-        self.train_mask = None
-        self.train_pos_edge_index = self.test_pos_edge_index = self.val_pos_edge_index = None
-        self._train_neg_edge_index = self._test_neg_edge_index = None
+        if config.DATASET_SPLIT:
+            self.train_pos_edge_index = self.test_pos_edge_index = self.val_pos_edge_index = None
+            self._train_neg_edge_index = self._test_neg_edge_index = None
 
-        self.train_pos_edge_mask = None
+            self.train_pos_edge_mask = None
 
-        self.split()
+            self.split()
 
     def __relabel_graph(self, x, y, node, index_start=0):
         """helper func for reorder_node"""
@@ -96,7 +103,6 @@ class SplitGraph(object):
 
     def split(self):
         # prepare pos/neg train/test edges
-        self.train_mask = self.set_train_mask()
         self.set_pos_edge()
         self.train_pos_edge_mask = self.set_train_pos_edge_mask()
         self.set_neg_edge()
@@ -139,60 +145,99 @@ class SplitGraph(object):
                 if added_edges_number >= train_edge_number:
                     h = self.graph.subgraph(added_node)
                     logging.critical("random sample subgraph done. %d edges sampled. ratio %f, with %d nodes" % (
-                        h.number_of_edges(), h.number_of_edges()/self.graph.number_of_edges(), h.number_of_nodes()))
+                        h.number_of_edges(), h.number_of_edges() / self.graph.number_of_edges(), h.number_of_nodes()))
                     return h
 
         raise RuntimeError("can not get {:d} edges starting from node {:d}".format(train_edge_number, start_node))
 
-    def get_border_node(self, number_limit):
-        r = {}
-        observed_nodes = set(list(self.observed_graph.nodes))
-        for n in self.observed_graph.nodes:
-            neighbor_n = set(self.graph.neighbors(n))
-            left_edge_number = len(neighbor_n - observed_nodes)
-            if left_edge_number > 0:
-                r[n] = left_edge_number
-        r = sorted(r.items(), key=lambda d: d[1], reverse=True)
-        if number_limit > len(r):
-            number_limit = len(r)
+    def get_detect_node(self, number_limit):
+        observed_nodes = list(self.observed_graph.nodes)
+        if number_limit > len(observed_nodes):
+            number_limit = len(observed_nodes)
             logging.debug("border node number limit is too big, no enough candidates, auto adjust it.")
-        logging.info(
-            f"border node candidates {len(r)}, edge number to unobserved part max {r[0][1]}, min {r[number_limit-1][1]}.")
-        return [n for i, (n, _) in enumerate(r) if i < number_limit]
+        logging.info(f"random select {number_limit} detect nodes")
+        return random.sample(observed_nodes, number_limit)
 
     def get_distance_constrain(self):
+        INF_DISTANCE = 2021
         import igraph
         graph_ig = igraph.Graph(n=self.num_nodes, edges=[e for e in self.graph.edges])
-        distance = graph_ig.shortest_paths(self.border_node, list(range(self.observed_index, self.num_nodes)))
-        border2contour = [None] * len(self.border_node)
-        for ib, b in enumerate(self.border_node):
-            b_contour = defaultdict(list)  # equal distance nodes
-            b_contour[0].append(b)
-            for iu, u in enumerate(range(self.observed_index, self.num_nodes)):
+        distance = graph_ig.shortest_paths(source=self.detect_node, target=list(range(self.num_nodes)))
+        distance = np.array(distance, dtype=np.int)
+        if config.DISTANCE_WORST:
+            detect_node_for_unobserved = np.random.choice(len(self.detect_node), self.num_nodes - self.observed_index)
+            observed_distance = distance[detect_node_for_unobserved, list(range(self.observed_index, self.num_nodes))]
+            distance[:, self.observed_index:] = INF_DISTANCE
+            distance[detect_node_for_unobserved, list(range(self.observed_index, self.num_nodes))] = observed_distance
+
+        query2layers = [None] * len(self.detect_node)
+        for ib, b in enumerate(self.detect_node):
+            b2layers = defaultdict(list)  # equal distance nodes
+            b2layers[0].append(b)
+            for iu, u in enumerate(range(self.num_nodes)):
                 # assert nx.shortest_path_length(self.graph, b, u) == distance[ib][iu]
-                b_contour[distance[ib][iu]].append(u)
-            border2contour[ib] = b_contour
+                b2layers[distance[ib][iu]].append(u)
+            query2layers[ib] = b2layers
 
         logging.info("distances from border nodes to others done.")
 
-        one_hop_index = []  # this position must have edge
-        no_edge_mask = np.zeros((self.num_nodes, self.num_nodes),
-                                   dtype=np.bool)  # True position can not have edge because distance constrains
-        for ib, b in enumerate(self.border_node):
-            b_contour = border2contour[ib]
-            for d1, d2 in combinations(b_contour.keys(), 2):
-                if abs(d2 - d1) > 1:
-                    no_edge_mask[np.ix_(b_contour[d1], b_contour[d2])] = True
-                    no_edge_mask[np.ix_(b_contour[d2], b_contour[d1])] = True
-            for n1 in b_contour[1]:
-                one_hop_index.append((b, n1))
+        positive_edge_mask = np.zeros((self.num_nodes, self.num_nodes),
+                                      dtype=np.bool)  # this position must have edge
+        non_edge_mask = np.zeros((self.num_nodes, self.num_nodes),
+                                 dtype=np.bool)  # True position can not have edge because distance constrains
+        for ib, b in enumerate(self.detect_node):
+            b2layers = query2layers[ib]
+            for d1, d2 in combinations(b2layers.keys(), 2):
+                if abs(d2 - d1) > 1 and d2 < INF_DISTANCE and d1 < INF_DISTANCE:
+                    non_edge_mask[np.ix_(b2layers[d1], b2layers[d2])] = True
+                    non_edge_mask[np.ix_(b2layers[d2], b2layers[d1])] = True
+            positive_edge_mask[b, b2layers[1]] = True
+            positive_edge_mask[b2layers[1], b] = True
 
-        unobserved_nodes_num = self.num_nodes - self.observed_index        
-        no_edge_num, one_hop_num  = no_edge_mask.sum()//2, len(one_hop_index)
-        all_possible_edge_num = self.observed_index*unobserved_nodes_num + unobserved_nodes_num*(unobserved_nodes_num-1)//2
-        certain_rate = (no_edge_num + one_hop_num) / all_possible_edge_num
-        logging.critical(f"no edge number {no_edge_num}, one hop edge number {one_hop_num}, uncertain edge number {all_possible_edge_num}, certain ratio {certain_rate:.4f}.")
-        return no_edge_mask, torch.tensor(one_hop_index).transpose(0, 1)
+        logging.info("non-edge and one hop edge done.")
+
+        if config.DISTANCE_CALC_EDGE and not config.DISTANCE_WORST:  # positive edge need all distance from b
+            for ib, b in enumerate(self.detect_node):
+                b2layers = query2layers[ib]
+                for dis in sorted(b2layers)[1:-1]:
+                    node_in_layer_dis, node_in_layer_dis_plus_one = np.array(b2layers[dis]), np.array(b2layers[dis + 1])
+                    if node_in_layer_dis.size == 0 or node_in_layer_dis_plus_one.size == 0:
+                        continue
+                    edge_between_adj_layer = non_edge_mask[np.ix_(node_in_layer_dis_plus_one, node_in_layer_dis)]
+                    v2_ = edge_between_adj_layer.sum(1) == (len(node_in_layer_dis) - 1)  # only one 0 in a row
+                    y = np.argwhere(edge_between_adj_layer[v2_] == 0)
+                    u = y[:, 1]
+                    v, u = node_in_layer_dis_plus_one[v2_], node_in_layer_dis[u]
+                    positive_edge_mask[v, u] = True
+                    positive_edge_mask[u, v] = True
+
+        unobserved_nodes_num = self.num_nodes - self.observed_index
+        all_possible_edge_num = self.observed_index * unobserved_nodes_num + unobserved_nodes_num * (
+                unobserved_nodes_num - 1) // 2
+
+        non_edge_mask[self.train_mask] = False
+        positive_edge_mask[self.train_mask] = False  # we don't count non-edge or edge in the observed part
+
+        non_edge_num, edge_num = non_edge_mask.sum() // 2, positive_edge_mask.sum() // 2
+        certain_rate = (non_edge_num + edge_num) / all_possible_edge_num
+        logging.critical(
+            f"no edge number {non_edge_num}, edge number {edge_num}, uncertain edge number {all_possible_edge_num}, certain ratio {certain_rate:.4f}.")
+        self.distance_non_edge_ratio = non_edge_num / (
+                all_possible_edge_num - (self.graph.number_of_edges() - self.observed_graph.number_of_edges()))
+        self.distance_edge_ratio = edge_num / (self.graph.number_of_edges() - self.observed_graph.number_of_edges())
+        logging.critical(
+            f"edge ratio in unobserved {self.distance_edge_ratio}, no edge ratio in unobserved {self.distance_non_edge_ratio}.")
+        inner_unobserved_non_edge_num, inner_unobserved_edge_num = non_edge_mask[self.observed_index:,
+                                                                   self.observed_index:].sum() // 2, \
+                                                                   positive_edge_mask[self.observed_index:,
+                                                                   self.observed_index:].sum() // 2
+        inner_g = self.graph.subgraph(list(range(self.observed_index, self.num_nodes)))
+        self.distance_inner_edge_ratio = inner_unobserved_edge_num / inner_g.number_of_edges()
+        self.distance_non_inner_edge_ratio = inner_unobserved_non_edge_num / (
+                unobserved_nodes_num * (unobserved_nodes_num - 1) // 2 - inner_g.number_of_edges())
+        logging.critical(
+            f"edge ratio in inner unobserved {self.distance_inner_edge_ratio}, no edge ratio in inner unobserved {self.distance_non_inner_edge_ratio}.")
+        return non_edge_mask, positive_edge_mask
 
     def set_train_mask(self):
         row = col = list(range(self.observed_index))
@@ -352,21 +397,94 @@ class SplitGraph(object):
             adj.add_(torch.eye(size))
         return adj
 
-    def get_label_smb_matrix(self):
+    def get_simple_sbm_matrix(self):
+        if config.ABLATE_SBM:
+            logging.critical("sbm matrix not working")
+            return torch.zeros((self.num_nodes, self.num_nodes))
         y = self.y
         uy = torch.unique(y)
         e = torch.eye(uy.size(0))
         l = e[y]
         return l.mm(l.t())
 
+    def get_sbm_matrix(self):
+        mat = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float)
+
+        if config.ABLATE_SBM:
+            logging.critical("sbm matrix not working")
+            return mat
+
+        train_pos_edge_index = [e for e in self.observed_graph.edges]
+        train_pos_edge_index = np.array(train_pos_edge_index, dtype=np.int).T
+        observed_adj = np.zeros((self.num_nodes, self.num_nodes), dtype=np.bool)
+        observed_adj[train_pos_edge_index[0], train_pos_edge_index[1]] = True
+        observed_adj[train_pos_edge_index[1], train_pos_edge_index[0]] = True
+
+        y = self.y.detach().cpu().numpy().T
+        uy = np.unique(y)
+        for c1, c2 in combinations_with_replacement(uy, 2):
+            all_n_c1 = np.argwhere(y == c1).reshape(-1)
+            all_n_c2 = np.argwhere(y == c2).reshape(-1)
+            n_c1 = all_n_c1[all_n_c1 < self.observed_index]
+            n_c2 = all_n_c2[all_n_c2 < self.observed_index]
+            edge_num = observed_adj[np.ix_(n_c1, n_c2)].sum()
+            possible_edge_num = n_c1.size * n_c2.size
+            if c1 == c2:
+                edge_num = edge_num // 2
+                possible_edge_num = (n_c1.size * (n_c2.size - 1)) // 2
+            if edge_num == 0:
+                possible_edge_num = 1  # just avoid divide 0
+            mat[np.ix_(all_n_c1, all_n_c2)] = edge_num / possible_edge_num
+
+        return mat
+
+
+def run(rnd_seed=123):
+    import random
+
+    random.seed(rnd_seed)
+    torch.manual_seed(rnd_seed)
+    config.DATASET_SPLIT = False
+    ratio = config.TRAIN_SAMPLE_RATIO
+    from dataset import Test, Pubmed, Cora, Citeseer, Wikics, FilmActor, Cornell, Texas, Wisconsin, concat_label
+    dataset = {"Pubmed": Pubmed, "Cora": Cora, "Citeseer": Citeseer, "WikiCS": Wikics, "Actor": FilmActor,
+               "Cornell": Cornell, "Texas": Texas, "Wisconsin": Wisconsin}
+
+    data, y = dataset[config.DATASET]()
+    data = concat_label(data, y)
+    data_graph = SplitGraph(data, train_edge_ratio=ratio, val_edge_ratio=(1 - ratio) / 2.0, y=y)
+    return data_graph.distance_edge_ratio, data_graph.distance_non_edge_ratio, data_graph.distance_inner_edge_ratio, data_graph.distance_non_inner_edge_ratio
+
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG, datefmt="%H-%M-%S", format="%(asctime)s %(message)s")
-    from dataset import Cora, Test
+    import pandas as pd
 
-    random.seed(12345)
-    data, _ = Test()
-    dg = SplitGraph(data, 0.75)
+    distance_all = pd.DataFrame()
+    datasets = ["Cora", "Pubmed", "Citeseer", "WikiCS", "Actor", "Cornell", "Texas", "Wisconsin"]
+    datasets = ["Cora", "Actor"]
+    for dataset in datasets:
+        config.DATASET = dataset
+        dp = [1, 2, 4, 8, 16, 32] # distance source node number
+        distance_confirmed_ratio = pd.DataFrame()
+        for d in dp:
+            config.DISTANCE_BORDER_NODE_NUM = d
+            d = pd.DataFrame()
+            for index in range(5):
+                r, nr, in_r, in_nr = run(index)
+                d = d.append(pd.DataFrame([[r, nr, in_r, in_nr]], columns=['Er', 'NEr', 'IEr', 'INEr']))
+
+            _mean = d.mean()
+            print(dataset)
+            print(d)
+            print(_mean)
+            distance_confirmed_ratio = distance_confirmed_ratio.append(
+                pd.DataFrame([[_mean.Er, _mean.NEr, _mean.IEr, _mean.INEr]],
+                             columns=['Er', 'NEr', 'IEr', 'INEr']))
+        distance_confirmed_ratio.index = [f"{dataset}-{d}" for d in dp]
+        distance_all = distance_all.append(distance_confirmed_ratio)
+    distance_all.to_excel(
+            f"./data/run_result/distance_ratio_{config.TRAIN_SAMPLE_RATIO}_{config.DISTANCE_BORDER_NODE_NUM}_sample.xls")
 
     # distance_z = torch.rand(dg.num_nodes, dg.num_nodes)
     # for i in range(10):

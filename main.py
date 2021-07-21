@@ -4,28 +4,30 @@ import numpy as np
 from mlp import run as mlp_run
 from gnn import run as gnn_run
 from GGCN.run_iso_nodes import ggcn_run
-# from kronem import run as kronem_run
+from kronem import run as kronem_run
 from forsati import run as forsati_run
+from sbm import run as sbm_run
 import config
 
 
 def main():
     # ratio = [0.01 * i for i in range(0, 51)] # sample edge ratio
-    # ratio = np.linspace(0, 0.12, 20)
+    ratio = np.linspace(0, 0.12, 20)
     # ratio = np.logspace(-4, -1, 11) # smb initial strength
-    # ratio = np.hstack([[0], ratio])
-    ratio = [0, 1, 2, 3, 4, 8, 16, 24, 32] # distance source node number
+    # ratio = np.hstack([[0], ratio])[:5]
+    # ratio = [0]# [0, 1, 2, 4, 8, 16, 32] # distance source node number
     all_result = pd.DataFrame()
     for r in ratio:
         # config.TRAIN_SAMPLE_RATIO = r
-        # config.SMB_RATIO = r
-        config.DISTANCE_BORDER_NODE_NUM = int(r)
+        config.SMB_RATIO = r
+        # config.DISTANCE_BORDER_NODE_NUM = int(r)
 
         all_best_metric_mlp = pd.DataFrame()
         all_best_metric_gnn = pd.DataFrame()
         all_best_metric_ggcn = pd.DataFrame()
         all_best_metric_kronem = pd.DataFrame()
         all_best_metric_fs = pd.DataFrame()
+        all_best_metric_sbm = pd.DataFrame()
 
         for index in range(config.TOTAL_RUN_TIME):
             seed = index
@@ -61,11 +63,18 @@ def main():
                 _best_metric = pd.DataFrame([[0, 0, 0, 'test', -1]], columns=['AUC', 'AP', 'MAE', 'TYPE', 'EPOCH'])
             all_best_metric_fs = all_best_metric_fs.append(_best_metric)
 
+            if "sbm" in config.ALGO:
+                _metric, _best_metric = sbm_run(seed)
+            else:
+                _best_metric = pd.DataFrame([[0, 0, 0, 'test', -1]], columns=['AUC', 'AP', 'MAE', 'TYPE', 'EPOCH'])
+            all_best_metric_sbm = all_best_metric_fs.append(_best_metric)
+
         mlp_mean, mlp_std = all_best_metric_mlp.mean(), all_best_metric_mlp.std()
         gnn_mean, gnn_std = all_best_metric_gnn.mean(), all_best_metric_gnn.std()
         ggcn_mean, ggcn_std = all_best_metric_ggcn.mean(), all_best_metric_ggcn.std()
         kronem_mean, kronem_std = all_best_metric_kronem.mean(), all_best_metric_kronem.std()
         fs_mean, fs_std = all_best_metric_fs.mean(), all_best_metric_fs.std()
+        sbm_mean, sbm_std = all_best_metric_sbm.mean(), all_best_metric_sbm.std()
 
         ratio_result = pd.DataFrame([(mlp_mean.AUC, mlp_mean.AP, mlp_mean.MAE,
                                       mlp_std.AUC, mlp_std.AP, mlp_std.MAE,
@@ -76,7 +85,9 @@ def main():
                                       kronem_mean.AUC, kronem_mean.AP, kronem_mean.MAE,
                                       kronem_std.AUC, kronem_std.AP, kronem_std.MAE,
                                       fs_mean.AUC, fs_mean.AP, fs_mean.MAE,
-                                      fs_std.AUC, fs_std.AP, fs_std.MAE
+                                      fs_std.AUC, fs_std.AP, fs_std.MAE,
+                                      sbm_mean.AUC, sbm_mean.AP, sbm_mean.MAE,
+                                      sbm_std.AUC, sbm_std.AP, sbm_std.MAE,
                                       )],
                                     columns=['MLP_AUC', 'MLP_AP', 'MLP_MAE',
                                              'MLP_AUC_std', 'MLP_AP_std', 'MLP_MAE_std',
@@ -87,36 +98,59 @@ def main():
                                              'KRONEM_AUC', 'KRONEM_AP', 'KRONEM_MAE',
                                              'KRONEM_AUC_std', 'KRONEM_AP_std', 'KRONEM_MAE_std',
                                              'fs_AUC', 'fs_AP', 'fs_MAE',
-                                             'fs_AUC_std', 'fs_AP_std', 'fs_MAE_std'
+                                             'fs_AUC_std', 'fs_AP_std', 'fs_MAE_std',
+                                             'sbm_AUC', 'sbm_AP', 'sbm_MAE',
+                                             'sbm_AUC_std', 'sbm_AP_std', 'sbm_MAE_std',
                                              ])
         logging.critical(f"ratio {r:.4f} done. results :\n{ratio_result.to_string()}")
 
         all_result = all_result.append(ratio_result)
     all_result.index = ratio
-    logging.critical(f"{config.DATASET} final results :\n{ratio_result.to_json()}")
+    logging.critical(f"{config.DATASET} final results :\n{all_result.to_json()}")
     enable_algo = "_".join(config.ALGO)
     all_result.to_excel(
-        f"./data/run_result/{enable_algo}_d{config.DATASET}_l{config.LOSS}_{config.DISTANCE_CONSTRAINT}_b{config.DISTANCE_BORDER_NODE_NUM}_i{config.VAL_INDICATOR}_s{config.SMB_RATIO}_r{config.TRAIN_SAMPLE_RATIO}_R{config.ROUND}.xls")
+        f"./data/run_result/alpha_{enable_algo}_d{config.DATASET}_l{config.LOSS}_dis{config.DISTANCE_CONSTRAINT}_b{config.DISTANCE_BORDER_NODE_NUM}_w{config.DISTANCE_WORST}_i{config.VAL_INDICATOR}_s{config.SMB_RATIO}_r{config.TRAIN_SAMPLE_RATIO}_R{config.ROUND}.xls")
     return all_result
 
 
 if __name__ == '__main__':
-    logging.basicConfig(filename='./data/dis.log', level=logging.CRITICAL, datefmt="%m-%d-%H-%M-%S", format="%(asctime)s %(message)s", filemode="w")
+    logging.basicConfig(filename='./data/debug2.log', level=logging.CRITICAL, datefmt="%m-%d-%H-%M-%S", format="%(asctime)s %(message)s", filemode="w")
+
+    # config.DATASET = 'Wisconsin'
+    # config.SMB_RATIO = 0.08
+    # main()
+
+    # config.DATASET = 'Texas'
+    # config.SMB_RATIO = 0#0.06
+    # main()
+
     # config.DATASET = 'Cora'
+    # config.SMB_RATIO = 0.0004
     # main()
+
+
+    # config.DATASET = 'Actor'
+    # config.SMB_RATIO = 0#0.04
+    # main()
+
+    # config.DATASET = 'Cornell'
+    # config.SMB_RATIO = 0.01
+    # main()
+    #
+    #
+    #
+    # config.DATASET = 'Cora'
+    # config.SMB_RATIO = 0.005
+    # main()
+    #
     # config.DATASET = 'Citeseer'
+    # config.SMB_RATIO = 0.001
     # main()
+
     # config.DATASET = 'Pubmed'
+    # config.SMB_RATIO = 0.000
     # main()
-    
-    config.DATASET = 'Cora'
-    config.SMB_RATIO = 0.005
-    main()
 
-    config.DATASET = 'Actor'
-    config.SMB_RATIO = 0.01
-    main()
-
-    config.DATASET = 'Wisconsin'
-    config.SMB_RATIO = 0.01
+    config.DATASET = 'WikiCS'
+    config.SMB_RATIO = 0.002
     main()

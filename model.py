@@ -18,13 +18,11 @@ class ModelBase:
         self.val_indicator_index = {'AUC': 0, 'AP': 1, 'MAE': 2}[config.VAL_INDICATOR]
         self.max_val_metric = 0
 
-    @staticmethod
-    def inner_product(z, edge_index):
+    def inner_product(self, z, edge_index):
         value = (z[edge_index[0]] * z[edge_index[1]]).sum(dim=1)
         return torch.sigmoid(value)
 
-    @staticmethod
-    def inner_product_all(z):
+    def inner_product_all(self, z):
         adj = torch.matmul(z, z.t())
         return torch.sigmoid(adj)
 

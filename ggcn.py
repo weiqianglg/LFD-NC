@@ -29,8 +29,7 @@ class CompletionWithGGcn(model.ModelBase):
         self.loss_val = loss
         self.optimizer.step()
 
-    @staticmethod
-    def inner_product(z, edge_index):
+    def inner_product(self, z, edge_index):
         """here z is a matrix return by sample_reconstruction, overwrite the base method for test"""
         row, col = edge_index
         return z[row, col].sigmoid()
